@@ -1,0 +1,503 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using log4net.Core;
+using Microsoft.Office.Interop.Excel;
+
+
+namespace Spreadsheet.Handler
+{
+    public static class Accuracy
+    {
+        private static Application _app;
+
+        private const int DefaultNumReps = 3;
+        private const int DefaultNumConcs = 3;
+
+        private const string TempDirectoryName = "ABD_TempFiles";
+
+
+        public static string UpdateAccuracySheet(string sourcePath, List<string> percentConcList, int numReps, string targetConc, string units)
+        {
+            string returnPath = "";
+            try
+            {
+                returnPath = UpdateAccuracySheet2(sourcePath, percentConcList, numReps, targetConc, units);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogMessage("An error occurred in the call to Accuracy.UpdateAccuracySheet. Message and stack trace are:\r\n" + ex.Message + "\r\n" + ex.StackTrace, Level.Error);
+
+                try
+                {
+                    if (_app.Workbooks.Count > 0)
+                    {
+                        try
+                        {
+                            _app.Workbooks[0].Save();
+                            returnPath = _app.Workbooks[0].FullName;
+                        }
+                        catch
+                        {
+                            Logger.LogMessage("An error occurred in the call to Accuracy.UpdateAccuracySheet. Failed to save current workbook changes and to get path.", Level.Error);
+                        }
+
+                        _app.Workbooks.Close();
+                    }
+                    _app = null;
+                }
+                catch
+                {
+                    Logger.LogMessage("An error occurred in the call to Accuracy.UpdateAccuracySheet. Application failed to close workbooks. Message and stack trace are:\r\n" + ex.Message + "\r\n" + ex.StackTrace, Level.Error);
+                }
+                finally
+                {
+                    WorksheetUtilities.ReleaseExcelApp();
+                }
+            }
+            return returnPath;
+        }
+
+        private static string UpdateAccuracySheet2(string sourcePath, IList<string> percentConcList, int numReps, string targetConc, string units)
+        {
+            if (!File.Exists(sourcePath))
+            {
+                Logger.LogMessage("Error in call to Accuracy.UpdateAccuracySheet. Invalid source file path specified.", Level.Error);
+                return "";
+            }
+
+            if (percentConcList == null || percentConcList.Count <= 0)
+            {
+                Logger.LogMessage("Error in call to Accuracy.UpdateAccuracySheet. Concentration list is empty.", Level.Error);
+                return "";
+            }
+
+            // Generate an random temp path to save new workbook
+            string savePath = WorksheetUtilities.CopyWorkbook(sourcePath, TempDirectoryName, "Accuracy Results.xls");
+            if (String.IsNullOrEmpty(savePath)) return "";
+            
+            // Try to open the file
+            _app = WorksheetUtilities.GetExcelApp();
+            _app.Workbooks.Open(savePath, Type.Missing, false, Type.Missing, Type.Missing, Type.Missing, Type.Missing, Type.Missing, Type.Missing, true, Type.Missing, Type.Missing, Type.Missing, Type.Missing, Type.Missing);
+
+            Workbook book = _app.Workbooks[1];
+            Worksheet sheet = book.Worksheets[1] as Worksheet;
+
+            if (sheet != null)
+            {
+                bool wasProtected = WorksheetUtilities.SetSheetProtection(sheet, null, false);
+
+                if (numReps > DefaultNumReps)
+                {
+                    int numRepsToInsert = numReps - DefaultNumReps;
+                    // Insert the extra rows into the named ranges in the raw data and validation results tables - do this first as later an insert/copy is simpler
+                    for (int i = 1; i < 4; i++)
+                    {
+                        WorksheetUtilities.InsertRowsIntoNamedRange(numRepsToInsert, sheet, "RawDataAndCalcsSet" + i, true, XlDirection.xlUp, XlPasteType.xlPasteAllExceptBorders);
+                        WorksheetUtilities.InsertRowsIntoNamedRange(numRepsToInsert, sheet, "ValidationResultsSet" + i, true, XlDirection.xlUp, XlPasteType.xlPasteAllExceptBorders);
+                    }
+                }
+                else if (numReps < DefaultNumReps)
+                {
+                    FixRawDataFormulas(sheet);
+                    // Only delete ONE row so to maintain sheet integrity (e.g. calculations)
+                    for (int i = 1; i <= DefaultNumReps; i++)
+                    {
+                        WorksheetUtilities.DeleteRowsFromNamedRange(1, sheet, "ValidationResultsSet" + i, XlDirection.xlUp);
+                        WorksheetUtilities.DeleteRowsFromNamedRange(1, sheet, "RawDataAndCalcsSet" + i, XlDirection.xlUp);
+                    }
+
+                    numReps = DefaultNumReps - 1;
+                }
+
+                if (percentConcList.Count > DefaultNumConcs)
+                {
+                    int numConcsToInsert = percentConcList.Count - DefaultNumConcs;
+                    // Insert the additional concs in the raw data and validation results tables - DO THIS BEFORE the Confidence and Results tables
+                    for (int i = 1; i <= numConcsToInsert; i++)
+                    {
+                        WorksheetUtilities.InsertRowsForNamedRange(sheet, "RawDataAndCalcsSet2", numReps, "RawDataAndCalcsSet1", true, XlPasteType.xlPasteAll);
+                        WorksheetUtilities.InsertRowsForNamedRange(sheet, "ValidationResultsSet2", numReps, "ValidationResultsSet2", true, XlPasteType.xlPasteAll);
+                    }
+
+                    WorksheetUtilities.CreateNamedRangeSeriesFromParent(sheet, "RawDataAndCalcsSet", numReps, 0, percentConcList.Count - 1);
+                    WorksheetUtilities.CreateNamedRangeSeriesFromParent(sheet, "ValidationResultsSet", numReps, 0, percentConcList.Count - 1);
+
+                    // Insert rows into the confidence interval table AND update formulas for rows 2..End (i.e. skip first row)
+                    WorksheetUtilities.InsertRowsIntoNamedRange(numConcsToInsert, sheet, "PercentConfidenceIntervals", false, XlDirection.xlDown, XlPasteType.xlPasteFormulas);
+                    UpdateConfidenceIntervalFormulas(sheet);
+
+                    // Insert rows into the results table AND update formulas for rows 2..End (i.e. skip first row)
+                    WorksheetUtilities.InsertRowsIntoNamedRange(numConcsToInsert, sheet, "ResultsTable", false, XlDirection.xlDown, XlPasteType.xlPasteFormulas);
+                    UpdateResultsFormulas(sheet);
+                }
+                else if (percentConcList.Count < DefaultNumConcs)
+                {
+                    // Need to delete some of the named ranges
+                    switch (DefaultNumConcs - percentConcList.Count)
+                    {
+                        case 1:
+                            // Work from the bottom up remove the "center" named ranges or rows
+                            WorksheetUtilities.DeleteNamedRangeRows(sheet, "ValidationResultsSet3");
+                            WorksheetUtilities.DeleteNamedRange(sheet, "ValidationResultsSet3");
+                            WorksheetUtilities.DeleteRowFromNamedRange(sheet, "ResultsTable", 3);
+                            WorksheetUtilities.DeleteRowFromNamedRange(sheet, "PercentConfidenceIntervals", 3);
+                            WorksheetUtilities.DeleteNamedRangeRows(sheet, "RawDataAndCalcsSet3");
+                            WorksheetUtilities.DeleteNamedRange(sheet, "RawDataAndCalcsSet3");
+                            break;
+                        case 2:
+                            // Work from the bottom up remove the last 2 named ranges or rows
+                            WorksheetUtilities.DeleteNamedRangeRows(sheet, "ValidationResultsSet3");
+                            WorksheetUtilities.DeleteNamedRange(sheet, "ValidationResultsSet3");
+                            WorksheetUtilities.DeleteNamedRangeRows(sheet, "ValidationResultsSet2");
+                            WorksheetUtilities.DeleteNamedRange(sheet, "ValidationResultsSet2");
+                            WorksheetUtilities.DeleteRowFromNamedRange(sheet, "ResultsTable", 3);
+                            WorksheetUtilities.DeleteRowFromNamedRange(sheet, "ResultsTable", 2);
+                            WorksheetUtilities.DeleteRowFromNamedRange(sheet, "PercentConfidenceIntervals", 3);
+                            WorksheetUtilities.DeleteRowFromNamedRange(sheet, "PercentConfidenceIntervals", 2);
+                            WorksheetUtilities.DeleteNamedRangeRows(sheet, "RawDataAndCalcsSet3");
+                            WorksheetUtilities.DeleteNamedRange(sheet, "RawDataAndCalcsSet3");
+                            WorksheetUtilities.DeleteNamedRangeRows(sheet, "RawDataAndCalcsSet2");
+                            WorksheetUtilities.DeleteNamedRange(sheet, "RawDataAndCalcsSet2");
+                            break;
+                    }
+                    
+                    
+                }
+
+                // Set conc values into Raw Data Table & set the borders
+                for (int i = 1; i <= percentConcList.Count; i++)
+                {
+                    WorksheetUtilities.SetNamedRangeValue(sheet, "RawDataAndCalcsSet" + i, percentConcList[i - 1], 1, 1);
+                    WorksheetUtilities.SetNamedRangeBorderEdges(sheet, "RawDataAndCalcsSet" + i, XlLineStyle.xlContinuous, XlBorderWeight.xlMedium);
+                }
+
+                // Set the target concentration and units
+                WorksheetUtilities.ReplaceInSheet(sheet, "?-mg/mL", targetConc + "-" + units);
+                WorksheetUtilities.ReplaceInSheet(sheet, "mg/mL", units);
+
+                try
+                {
+                    _app.Goto(sheet.Cells[1, 1], true);
+                }
+                catch
+                {
+                    Logger.LogMessage("Scroll of sheet failed in Accuracy.UpdateAccuracySheet!", Level.Error);
+                }
+
+                if (wasProtected) WorksheetUtilities.SetSheetProtection(sheet, null, true);
+
+                while (Marshal.ReleaseComObject(sheet) >= 0) { }
+            }
+
+            _app.Workbooks[1].Save();
+
+            while (Marshal.ReleaseComObject(book) >= 0) { }
+            _app.Workbooks.Close();
+
+            //while (Marshal.ReleaseComObject(_app) >= 0) { }
+            _app = null;
+            WorksheetUtilities.ReleaseExcelApp();
+
+            return savePath;
+        }
+
+
+        /// <summary>
+        /// Called to fix/correct the calculation formulas within the RawDataAndCalcsSet ranges. Called before removing the bottom
+        /// most row from these ranges (otherwise a reference error will occur).
+        /// </summary>
+        private static void FixRawDataFormulas(_Worksheet sheet)
+        {
+            const string namedRangeBase = "RawDataAndCalcsSet";
+            const int numFormulasToFix = 4;
+            const int startCellCol = 7;
+            const int formulaRow = 1;
+            const int lastRowNum = 12;
+
+            for (int i = DefaultNumConcs; i >= 1; i--)
+            {
+                // Get the range by name for the FIRST range in the raw data series
+                object objNamedRange = sheet.Names.Item(namedRangeBase + i, Type.Missing, Type.Missing);
+                if (objNamedRange == null || !(objNamedRange is Name)) continue;
+                Name namedRange = objNamedRange as Name;
+                Range range = namedRange.RefersToRange;
+
+                int curFormulaRow = lastRowNum - ((DefaultNumConcs - i) * DefaultNumReps);
+
+                for (int j = 0; j < numFormulasToFix; j++)
+                {
+                    Range cell = range.Cells[formulaRow, startCellCol + j] as Range;
+                    if (cell != null)
+                    {
+                        //string cellAddress = cell.get_AddressLocal(true, true, XlReferenceStyle.xlA1, Type.Missing, Type.Missing);
+                        
+                        string formula = cell.Formula.ToString();
+                        cell.Value2 = formula.Replace(curFormulaRow + "=", (curFormulaRow - 1) + "=");
+                        while (Marshal.ReleaseComObject(cell) >= 0) { }
+                    }
+                }
+
+                // Clean up
+                try
+                {
+                    if (range != null) while (Marshal.ReleaseComObject(range) >= 0) { }
+                    while (Marshal.ReleaseComObject(namedRange) >= 0) { }
+                    while (Marshal.ReleaseComObject(objNamedRange) >= 0) { }
+                }
+                catch
+                {
+                    continue;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Updates the formulas within the confidence interval table so to point to the correct addresses of cells used within the formulas
+        /// </summary>
+        /// <param name="sheet">The sheet in which to update.</param>
+        private static void UpdateConfidenceIntervalFormulas(_Worksheet sheet)
+        {
+            const string confTableName = "PercentConfidenceIntervals";
+            const string rawDataSet1Name = "RawDataAndCalcsSet1";
+
+            Name confNamedRange = null;
+            Range confRange = null;
+            object objRawDataSet1NamedRange = null;
+            Name rawDataSet1NamedRange = null;
+            Range rawDataSet1Range = null;
+            Range rangeRow = null;
+            Range rangeConc = null;
+            Range rangeLower = null;
+            Range rangeUpper = null;
+
+            // Get the range by name for the FIRST range in the raw data series
+            object objConfNamedRange = sheet.Names.Item(confTableName, Type.Missing, Type.Missing);
+            if (objConfNamedRange == null || !(objConfNamedRange is Name)) goto CleanUp_UpdateConfidenceIntervalFormulas;
+            confNamedRange = objConfNamedRange as Name;
+            confRange = confNamedRange.RefersToRange;
+
+            // The first row's forumlas should be okay, it's the rest of the rows that need some correction
+            int numRowsToUpdate = confRange.Rows.Count - 1;
+
+            // Get the formulas from the first row in the confidence table
+            // Should be something like =B4
+            string concFormula = ((Range)confRange.Cells[1, 1]).FormulaLocal.ToString();
+            // Should be something like =IF(I4>=3,F4-TINV(0.05,2)*(H4/SQRT(I4)),"ERROR")
+            string lowerConfFormula = ((Range)confRange.Cells[1, 3]).FormulaLocal.ToString();
+            // Should be something like =F4+TINV(0.05,2)*(H4/SQRT(I4))
+            string upperConfFormula = ((Range)confRange.Cells[1, 4]).FormulaLocal.ToString();
+
+            // Get row number for the first data set and number of replicates
+            objRawDataSet1NamedRange = sheet.Names.Item(rawDataSet1Name, Type.Missing, Type.Missing);
+            if (objRawDataSet1NamedRange == null || !(objRawDataSet1NamedRange is Name)) goto CleanUp_UpdateConfidenceIntervalFormulas;
+            rawDataSet1NamedRange = objRawDataSet1NamedRange as Name;
+            rawDataSet1Range = rawDataSet1NamedRange.RefersToRange;
+
+            int startRawRowNum = ((Range)rawDataSet1Range.Cells[1, 1]).Row;
+            int numReps = rawDataSet1Range.Rows.Count;
+
+            // Update the formula base on the number of concs, taking into account the replicates in each conc within the raw data table
+            for (int i = 2; i <= numRowsToUpdate; i++)
+            {
+                try
+                {
+                    rangeRow = confRange.Rows[i, Type.Missing] as Range;
+                    if (rangeRow == null) continue;
+
+                    int newRowNum = (startRawRowNum + (numReps * (i - 1)));
+
+                    // Set the conc formula
+                    string newConcFormula = concFormula.Replace("B" + startRawRowNum, "B" + newRowNum);
+                    rangeConc = ((Range)rangeRow.Cells[1, 1]);
+                    //string addressConc = conc.get_Address(Type.Missing, Type.Missing, XlReferenceStyle.xlA1, Type.Missing, Type.Missing);
+                    rangeConc.FormulaLocal = newConcFormula;
+
+                    while (Marshal.ReleaseComObject(rangeConc) >= 0) { }
+
+                    // Set the lower confidence formula
+                    string newLowerFormula = lowerConfFormula.Replace("K" + startRawRowNum, "K" + newRowNum);
+                    newLowerFormula = newLowerFormula.Replace("H" + startRawRowNum, "H" + newRowNum);
+                    newLowerFormula = newLowerFormula.Replace("J" + startRawRowNum, "J" + newRowNum);
+                    rangeLower = ((Range)rangeRow.Cells[1, 3]);
+                    //string addressLower = lower.get_Address(Type.Missing, Type.Missing, XlReferenceStyle.xlA1, Type.Missing, Type.Missing);
+                    rangeLower.FormulaLocal = newLowerFormula;
+
+                    while (Marshal.ReleaseComObject(rangeLower) >= 0) { }
+
+                    // Set the upper confidence formula
+                    string newUpperFormula = upperConfFormula.Replace("K" + startRawRowNum, "K" + newRowNum);
+                    newUpperFormula = newUpperFormula.Replace("H" + startRawRowNum, "H" + newRowNum);
+                    newUpperFormula = newUpperFormula.Replace("J" + startRawRowNum, "J" + newRowNum);
+                    rangeUpper = ((Range)rangeRow.Cells[1, 4]);
+                    //string addressUpper = upper.get_Address(Type.Missing, Type.Missing, XlReferenceStyle.xlA1, Type.Missing, Type.Missing);
+                    rangeUpper.FormulaLocal = newUpperFormula;
+
+                    while (Marshal.ReleaseComObject(rangeUpper) >= 0) { }
+                    while (Marshal.ReleaseComObject(rangeRow) >= 0) { }
+                }
+                catch
+                {
+                    continue;
+                }
+            }
+
+            // The com objects must always be released
+            CleanUp_UpdateConfidenceIntervalFormulas:
+            {
+                try
+                {
+                    if (objConfNamedRange != null) while (Marshal.ReleaseComObject(objConfNamedRange) >= 0) { }
+                    if (confRange != null) while (Marshal.ReleaseComObject(confRange) >= 0) { }
+                    if (confNamedRange != null) while (Marshal.ReleaseComObject(confNamedRange) >= 0) { }
+                    if (objRawDataSet1NamedRange != null) while (Marshal.ReleaseComObject(objRawDataSet1NamedRange) >= 0) { }
+                    if (rawDataSet1NamedRange != null) while (Marshal.ReleaseComObject(rawDataSet1NamedRange) >= 0) { }
+                    if (rawDataSet1Range != null) while (Marshal.ReleaseComObject(rawDataSet1Range) >= 0) { }
+
+                    if (rangeRow != null) while (Marshal.ReleaseComObject(rangeRow) >= 0) { }
+                    if (rangeConc != null) while (Marshal.ReleaseComObject(rangeConc) >= 0) { }
+                    if (rangeLower != null) while (Marshal.ReleaseComObject(rangeLower) >= 0) { }
+                    if (rangeUpper != null) while (Marshal.ReleaseComObject(rangeUpper) >= 0) { }
+                }
+                catch
+                {
+                    return;
+                }
+            }
+
+        }
+
+
+        /// <summary>
+        /// Updates the formulas within the results table so to point to the correct addresses of cells used within the formulas
+        /// </summary>
+        /// <param name="sheet">The sheet in which to update.</param>
+        private static void UpdateResultsFormulas(_Worksheet sheet)
+        {
+            const string resultsTableName = "ResultsTable";
+            const string confTableName = "PercentConfidenceIntervals";
+            const string rawDataSet1Name = "RawDataAndCalcsSet1";
+
+            Name resultsNamedRange = null;
+            Range resultsRange = null;
+            object objRawDataSet1NamedRange = null;
+            Name rawDataSet1NamedRange = null;
+            Range rawDataSet1Range = null;
+            object objConfTableNamedRange = null;
+            Name confTableNamedRange = null;
+            Range confTableRange = null;
+            Range rangeRow = null;
+            Range rangeConc = null;
+            Range rangeMean = null;
+            Range rangeLowerUpper = null;
+
+            // Get the range by name for the FIRST range in the raw data series
+            object objResultsNamedRange = sheet.Names.Item(resultsTableName, Type.Missing, Type.Missing);
+            if (objResultsNamedRange == null || !(objResultsNamedRange is Name)) goto CleanUp_UpdateResultsFormulas;
+            resultsNamedRange = objResultsNamedRange as Name;
+            resultsRange = resultsNamedRange.RefersToRange;
+
+            // The first row's forumlas should be okay, it's the rest of the rows that need some correction
+            int numRowsToUpdate = resultsRange.Rows.Count - 1;
+
+            // Get the formulas from the first row in the confidence table
+            // Should be something like =TEXT(B4, "#%") & " (2.5-ug/ml)"
+            string concFormula = ((Range)resultsRange.Cells[1, 1]).FormulaLocal.ToString();
+            // Should be something like =IF(F4=""," ",F4)
+            string meanRecoveryFormula = ((Range)resultsRange.Cells[1, 2]).FormulaLocal.ToString();
+            // Should be something like =IF(I4>=3,CONCATENATE(ROUNDDOWN(D29,1), "/", ((ROUNDUP(E29,1)))),"ERROR")
+            string lowerUpperConfFormula = ((Range)resultsRange.Cells[1, 3]).FormulaLocal.ToString();
+
+            // Get row number for the first data set and number of replicates
+            objRawDataSet1NamedRange = sheet.Names.Item(rawDataSet1Name, Type.Missing, Type.Missing);
+            if (objRawDataSet1NamedRange == null || !(objRawDataSet1NamedRange is Name)) goto CleanUp_UpdateResultsFormulas;
+            rawDataSet1NamedRange = objRawDataSet1NamedRange as Name;
+            rawDataSet1Range = rawDataSet1NamedRange.RefersToRange;
+
+            int startRawRowNum = ((Range)rawDataSet1Range.Cells[1, 1]).Row;
+            int numReps = rawDataSet1Range.Rows.Count;
+
+            // Get row number for the first in the confidence intervals table
+            objConfTableNamedRange = sheet.Names.Item(confTableName, Type.Missing, Type.Missing);
+            if (objConfTableNamedRange == null || !(objConfTableNamedRange is Name)) goto CleanUp_UpdateResultsFormulas;
+            confTableNamedRange = objConfTableNamedRange as Name;
+            confTableRange = confTableNamedRange.RefersToRange;
+
+            int startConfTableRowNum = ((Range)confTableRange.Cells[1, 1]).Row;
+
+            // Update the formula base on the number of concs, taking into account the replicates in each conc within the raw data table
+            for (int i = 2; i <= numRowsToUpdate; i++)
+            {
+                try
+                {
+                    rangeRow = resultsRange.Rows[i, Type.Missing] as Range;
+                    if (rangeRow == null) continue;
+
+                    int newRowNum = (startRawRowNum + (numReps * (i - 1)));
+
+                    // Set the conc formula
+                    string newConcFormula = concFormula.Replace("B" + startRawRowNum, "B" + newRowNum);
+                    rangeConc = ((Range)rangeRow.Cells[1, 1]);
+                    //string addressConc = conc.get_Address(Type.Missing, Type.Missing, XlReferenceStyle.xlA1, Type.Missing, Type.Missing);
+                    rangeConc.FormulaLocal = newConcFormula;
+
+                    while (Marshal.ReleaseComObject(rangeConc) >= 0) { }
+
+                    // Set the lower confidence formula
+                    string newMeanFormula = meanRecoveryFormula.Replace("H" + startRawRowNum, "H" + newRowNum);
+                    rangeMean = ((Range)rangeRow.Cells[1, 2]);
+                    //string addressMean = mean.get_Address(Type.Missing, Type.Missing, XlReferenceStyle.xlA1, Type.Missing, Type.Missing);
+                    rangeMean.FormulaLocal = newMeanFormula;
+
+                    while (Marshal.ReleaseComObject(rangeMean) >= 0) { }
+
+                    // Set the upper confidence formula
+                    string newLowerUpperConfFormula = lowerUpperConfFormula.Replace("K" + startRawRowNum, "K" + newRowNum);
+                    // Change up to use the first row in the confidence intervals table
+                    newRowNum = (startConfTableRowNum + (i - 1));
+                    newLowerUpperConfFormula = newLowerUpperConfFormula.Replace("D" + startConfTableRowNum, "D" + newRowNum);
+                    newLowerUpperConfFormula = newLowerUpperConfFormula.Replace("E" + startConfTableRowNum, "E" + newRowNum);
+                    rangeLowerUpper = ((Range)rangeRow.Cells[1, 3]);
+                    //string addressLowerUpper = lowerUpper.get_Address(Type.Missing, Type.Missing, XlReferenceStyle.xlA1, Type.Missing, Type.Missing);
+                    rangeLowerUpper.FormulaLocal = newLowerUpperConfFormula;
+
+                    while (Marshal.ReleaseComObject(rangeLowerUpper) >= 0) { }
+                    while (Marshal.ReleaseComObject(rangeRow) >= 0) { }
+                }
+                catch
+                {
+                    continue;
+                }
+            }
+
+            // The com objects must always be released
+            CleanUp_UpdateResultsFormulas:
+            {
+                try
+                {
+                    if (objResultsNamedRange != null) while (Marshal.ReleaseComObject(objResultsNamedRange) >= 0) { }
+                    if (resultsNamedRange != null) while (Marshal.ReleaseComObject(resultsNamedRange) >= 0) { }
+                    if (resultsRange != null) while (Marshal.ReleaseComObject(resultsRange) >= 0) { }
+                    if (objRawDataSet1NamedRange != null) while (Marshal.ReleaseComObject(objRawDataSet1NamedRange) >= 0) { }
+                    if (rawDataSet1NamedRange != null) while (Marshal.ReleaseComObject(rawDataSet1NamedRange) >= 0) { }
+                    if (rawDataSet1Range != null) while (Marshal.ReleaseComObject(rawDataSet1Range) >= 0) { }
+                    if (objConfTableNamedRange != null) while (Marshal.ReleaseComObject(objConfTableNamedRange) >= 0) { }
+                    if (confTableNamedRange != null) while (Marshal.ReleaseComObject(confTableNamedRange) >= 0) { }
+                    if (confTableRange != null) while (Marshal.ReleaseComObject(confTableRange) >= 0) { }
+                    if (rangeRow != null) while (Marshal.ReleaseComObject(rangeRow) >= 0) { }
+                    if (rangeConc != null) while (Marshal.ReleaseComObject(rangeConc) >= 0) { }
+                    if (rangeMean != null) while (Marshal.ReleaseComObject(rangeMean) >= 0) { }
+                    if (rangeLowerUpper != null) while (Marshal.ReleaseComObject(rangeLowerUpper) >= 0) { }
+                }
+                catch
+                {
+                    return;
+                }
+            }
+
+
+        }
+
+    }
+}

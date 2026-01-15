@@ -1,0 +1,2 @@
+C:\Users\Matthew\Downloads\ExcelInterop-main\Spreadsheet.Handler\obj\Debug\Spreadsheet.Handler.csproj.AssemblyReference.cache
+C:\Users\Matthew\Downloads\ExcelInterop-main\Spreadsheet.Handler\obj\Debug\Spreadsheet.Handler.csproj.CoreCompileInputs.cache
